@@ -4,118 +4,140 @@ import requests
 import plotly.express as px
 from datetime import datetime, timedelta
 
-# --- 1. 基本設定與金鑰 ---
-st.set_page_config(page_title="番茄 AI 30日精準預報站", layout="wide", page_icon="🍅")
-# 修正後的 API 基礎網址
+# --- 1. 初始化設定 ---
+st.set_page_config(page_title="番茄 AI 實時預報系統", layout="wide", page_icon="🍅")
+
+# 你的 API 金鑰
 CWA_API_KEY = "CWA-51BA8479-96B3-4B10-B9E4-B815F641B789"
 
-# --- 2. 自動抓取氣象歷史特徵 (修正網址拼接 Bug) ---
+# --- 2. 【即時氣象數據】自動對接氣象署 API ---
 @st.cache_data(ttl=86400)
-def get_ml_features():
-    # 確保網址格式正確：網址 + 端點 + ?授權碼 + &站號
+def fetch_realtime_weather():
+    """
+    根據當前日期，自動抓取 Lag 2 和 Lag 3 的真實觀測值
+    """
+    # 站碼 467480 (嘉義站) - 番茄重要產區
     url = f"https://opendata.cwa.gov.tw{CWA_API_KEY}&StationID=467480"
     
-    # 預設保底數值
-    features = {
-        "rain_l2": 95.0, "temp_l2": 18.5, "rain_l3": 75.0, "temp_l3": 17.5,
-        "sunshine": 5.2, "time_ord": datetime.now().timetuple().tm_yday
-    }
+    # 初始化特徵包 (若 API 異常時的保底參考值)
+    features = {"rain_l2": 0.0, "temp_l2": 0.0, "rain_l3": 0.0, "temp_l3": 0.0, "time_ord": datetime.now().timetuple().tm_yday}
 
     try:
         r = requests.get(url, timeout=15)
         data = r.json()
+        # 解析月份列表
+        months_list = data['records']['Status']['Station']['MonthlyStatistics']['Month']
         
-        # 取得月份統計資料
-        if 'records' in data:
-            monthly_data = data['records']['Status']['Station']['MonthlyStatistics']['Month']
-            current_month = datetime.now().month
-            
-            # 計算 Lag 2 與 Lag 3 的目標月份
-            target_l2 = (current_month - 2) if current_month > 2 else (current_month + 10)
-            target_l3 = (current_month - 3) if current_month > 3 else (current_month + 9)
-            
-            for m_info in monthly_data:
-                m = int(m_info['MonthNumber'])
-                if m == target_l2:
-                    features["rain_l2"] = float(m_info['Statistics']['Precipitation']['Precipitation'])
-                    features["temp_l2"] = float(m_info['Statistics']['Temperature']['Mean'])
-                if m == target_l3:
-                    features["rain_l3"] = float(m_info['Statistics']['Precipitation']['Precipitation'])
-                    features["temp_l3"] = float(m_info['Statistics']['Temperature']['Mean'])
+        curr_m = datetime.now().month
+        # 計算滯後月份 (例如 3月 -> Lag2 是 1月, Lag3 是 12月)
+        target_l2 = (curr_m - 2) if curr_m > 2 else (curr_m + 10)
+        target_l3 = (curr_m - 3) if curr_m > 3 else (curr_m + 9)
+
+        for m_data in months_list:
+            m_num = int(m_data['MonthNumber'])
+            if m_num == target_l2:
+                features["rain_l2"] = float(m_data['Statistics']['Precipitation']['Precipitation'])
+                features["temp_l2"] = float(m_data['Statistics']['Temperature']['Mean'])
+            elif m_num == target_l3:
+                features["rain_l3"] = float(m_data['Statistics']['Precipitation']['Precipitation'])
+                features["temp_l3"] = float(m_data['Statistics']['Temperature']['Mean'])
         return features
     except Exception as e:
-        st.warning(f"⚠️ 自動對接微調中，目前使用產區基準值預測。")
+        st.sidebar.warning(f"氣象 API 連線中或異常: {e}")
         return features
 
-# --- 3. 抓取農業部行情 ---
+# --- 3. 【即時市場數據】自動對接農業部 API ---
 @st.cache_data(ttl=3600)
-def get_market_price():
+def fetch_realtime_market():
+    """
+    抓取今日批發市場最新成交價
+    """
     url = "https://data.moa.gov.tw"
     try:
         r = requests.get(url, timeout=10)
         df = pd.DataFrame(r.json())
+        # 過濾番茄類
         df = df[df['作物名稱'].str.contains('番茄', na=False)].copy()
-        df['平均價'] = pd.to_numeric(df['平均價'], errors='coerce').fillna(45.0)
-        return df
-    except:
-        return pd.DataFrame({"作物名稱":["牛番茄"], "平均價":[45.0]})
+        # 轉換數值格式
+        df['平均價'] = pd.to_numeric(df['平均價'], errors='coerce')
+        df['交易量'] = pd.to_numeric(df['交易量'], errors='coerce')
+        return df.dropna(subset=['平均價'])
+    except Exception as e:
+        st.sidebar.error(f"市場 API 連線異常: {e}")
+        return pd.DataFrame({"作物名稱":["無資料"], "平均價":[0], "交易量":[0]})
 
-# --- 4. 核心預測引擎 (依圖片權重：Rain_Lag2=0.437) ---
-def predict_30day_by_img(base_p, f, is_fest):
-    # 權重計算：雨量 Lag2 (0.437), 時間 (0.155), 溫度 Lag2 (0.064)
-    impact_rain_l2 = (f['rain_l2'] - 80) * 0.12 * 0.437317
-    impact_temp_l2 = (f['temp_l2'] - 19) * 0.45 * 0.064656
-    fest_bonus = 12.0 if is_fest else 0
+# --- 4. 【核心引擎】依圖片權重進行 30 天推理 ---
+def ai_engine_30d(base_p, f, is_fest):
+    # 權重 1: Lag2 雨量 (0.437317) - 以歷史均值 100mm 為基準線
+    impact_rain = (f['rain_l2'] - 100) * 0.15 * 0.437317
+    # 權重 3: Lag2 氣溫 (0.064656) - 以 20度 為基準線
+    impact_temp = (f['temp_l2'] - 20) * 0.5 * 0.064656
+    # 節慶因子 (商業預警)
+    fest_bonus = 15.0 if is_fest else 0
     
     preds = []
     for i in range(30):
-        # 隨著預測天數增加，時間序數影響力 (0.155)
-        impact_time = (f['time_ord'] + i) * 0.015 * 0.155698
-        p = base_p + impact_rain_l2 + impact_temp_l2 + impact_time + fest_bonus + (i * 0.35)
-        preds.append(round(p, 1))
+        # 權重 2: Time_Ordinal (0.155698)
+        current_ord = f['time_ord'] + i
+        impact_time = (current_ord * 0.01) * 0.155698
+        
+        # 綜合計算：基礎價 + 權重修正項 + 時間趨勢
+        price = base_p + impact_rain + impact_temp + impact_time + fest_bonus + (i * 0.4)
+        preds.append(round(price, 1))
     return preds
 
-# --- 5. UI 介面 ---
-st.title("🍅 番茄 30 日精準預報 (數據對接修正版)")
+# --- 5. 網頁 UI 呈現 ---
+st.title("🍅 番茄 30 日全數據自動預報系統")
+st.markdown(f"**目前時間：** {datetime.now().strftime('%Y-%m-%d %H:%M')} | **核心模型：** Top 20 關鍵特徵權重版")
 
-f = get_ml_features()
-price_df = get_market_price()
+# 獲取實時數據
+weather_feat = fetch_realtime_weather()
+market_df = fetch_realtime_market()
 
 with st.sidebar:
-    st.header("📋 參數監測")
-    target = st.selectbox("選擇品種", price_df['作物名稱'].unique())
-    
-    # --- 修正 Bug：加上 [0] 確保抓到單行資料 ---
-    selected_data = price_df[price_df['作物名稱'] == target]
-    if not selected_data.empty:
-        row = selected_data.iloc[0] 
-        base_price = float(row['平均價'])
+    st.header("🔍 即時數據監控")
+    if not market_df.empty and market_df['作物名稱'].iloc[0] != "無資料":
+        target = st.selectbox("請選擇番茄品種", market_df['作物名稱'].unique())
+        selected_row = market_df[market_df['作物名稱'] == target].iloc[0]
+        base_price = float(selected_row['平均價'])
+        st.success(f"已對接今日市場價：{base_price} 元")
     else:
+        st.error("無法取得即時市場價格")
         base_price = 45.0
 
     st.divider()
-    st.metric("Lag2 月雨量 (自動抓取)", f"{f['rain_l2']} mm")
-    st.metric("Lag2 月均溫 (自動抓取)", f"{f['temp_l2']} °C")
+    st.write("**📡 氣象署實時回傳 (Lag 2)：**")
+    st.metric("二個月前累積雨量", f"{weather_feat['rain_l2']} mm")
+    st.metric("二個月前平均氣溫", f"{weather_feat['temp_l2']} °C")
     
     st.divider()
-    is_fest = st.checkbox("考慮節慶因素")
+    is_festival = st.checkbox("考慮節慶溢價因素")
 
-# 執行預測
-preds = predict_30day_by_img(base_price, f, is_fest)
-dates = [(datetime.now() + timedelta(days=i)).strftime("%m/%d") for i in range(30)]
+# 運算並繪圖
+if base_price > 0:
+    predictions = ai_engine_30d(base_price, weather_feat, is_festival)
+    dates = [(datetime.now() + timedelta(days=i)).strftime("%m/%d") for i in range(30)]
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    fig = px.line(x=dates, y=preds, text=[v if i%5==0 else "" for i,v in enumerate(preds)], 
-                 title=f"{target} 未來 30 天價格預報走勢")
-    fig.update_traces(line_color="#E74C3C", marker=dict(size=8), textposition="top center")
-    st.plotly_chart(fig, use_container_width=True)
-
-with col2:
-    st.metric("今日均價", f"{base_price} 元")
-    st.metric("30天後預測", f"{preds[-1]} 元", delta=f"{round(preds[-1]-base_price, 1)} 元")
+    col1, col2 = st.columns([2, 1])
     
-    st.write("---")
-    st.write("**🧠 模型診斷**")
-    st.caption("基於權重排行榜分析：")
-    st.info(f"當前影響預測最大的因素為 **兩個月前降雨量** ({f['rain_l2']}mm)，權重佔比 43.7%。")
+    with col1:
+        fig = px.line(x=dates, y=predictions, text=[v if i%5==0 else "" for i,v in enumerate(predictions)],
+                     title=f"{target} 未來一個月預測走勢", labels={'x':'日期', 'y':'預估價格 (元/kg)'})
+        fig.update_traces(line_color="#E74C3C", marker=dict(size=8), textposition="top center")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.metric("今日實時均價", f"{base_price} 元")
+        st.metric("30 天後 AI 預測", f"{predictions[-1]} 元", delta=f"{round(predictions[-1]-base_price, 1)} 元")
+        
+        st.divider()
+        st.write("### 🧠 模型權重分析")
+        st.write(f"- **最大影響因子**：二個月前雨量 ({weather_feat['rain_l2']}mm)，權重 43.7%")
+        st.write(f"- **年度季節趨勢**：年度序數 ({weather_feat['time_ord']})，權重 15.5%")
+        
+        if predictions[-1] > base_price * 1.15:
+            st.warning("⚠️ 預警：受滯後氣候影響，一個月後價格看漲。")
+        else:
+            st.info("✅ 資訊：目前氣候因子對價格影響平穩。")
+
+st.caption("數據自動對接來源：中華民國農業部、中央氣象署開放資料平臺")
